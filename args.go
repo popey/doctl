@@ -150,6 +150,8 @@ const (
 	ArgTemplate = "template"
 	// ArgVersion is the version of the command to use
 	ArgVersion = "version"
+	// ArgVerbose enables verbose output
+	ArgVerbose = "verbose"
 
 	// ArgOutput is an output type argument.
 	ArgOutput = "output"

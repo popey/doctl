@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -152,6 +153,10 @@ func kubernetesKubeconfig() *Command {
 	CmdBuilder(cmd, RunKubernetesKubeconfigSave, "save <cluster-id|cluster-name>", "save a cluster's credentials to your local kubeconfig", Writer, aliasOpt("s"))
 	CmdBuilder(cmd, RunKubernetesKubeconfigRemove, "remove <cluster-id|cluster-name>", "remove a cluster's credentials from your local kubeconfig", Writer, aliasOpt("d", "rm"))
 	return cmd
+}
+
+func kubeconfigCachePath() string {
+	return filepath.Join(configHome(), "cache", "exec-credential")
 }
 
 func kubernetesNodePools() *Command {
@@ -400,6 +405,67 @@ func RunKubernetesKubeconfigShow(c *CmdConfig) error {
 	return err
 }
 
+func cachedExecCredentialPath(id string) string {
+	return filepath.Join(kubeconfigCachePath(), id+".json")
+}
+
+// loadCachedExecCredential attempts to load the cached exec credential from disk. Never errors
+// Returns nil if there's no credential, if it failed to load it, or if it's expired.
+func loadCachedExecCredential(id string) (*clientauthentication.ExecCredential, error) {
+	path := cachedExecCredentialPath(id)
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+
+		return nil, err
+	}
+
+	defer f.Close()
+
+	var execCredential *clientauthentication.ExecCredential
+	if err := json.NewDecoder(f).Decode(&execCredential); err != nil {
+		return nil, err
+	}
+
+	if execCredential.Status == nil {
+		// Invalid ExecCredential, remove it
+		err = os.Remove(path)
+		return nil, err
+	}
+
+	t := execCredential.Status.ExpirationTimestamp
+	if t.IsZero() || t.Time.Before(time.Now()) {
+		err = os.Remove(path)
+		return nil, err
+	}
+
+	return execCredential, nil
+}
+
+// cacheExecCredential caches an ExecCredential to the doctl cache directory
+func cacheExecCredential(id string, execCredential *clientauthentication.ExecCredential) error {
+	// Don't bother caching if there's no expiration set
+	if execCredential.Status.ExpirationTimestamp.IsZero() {
+		return nil
+	}
+
+	cachePath := kubeconfigCachePath()
+	if err := os.MkdirAll(cachePath, os.FileMode(0700)); err != nil {
+		return err
+	}
+
+	path := cachedExecCredentialPath(id)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, os.FileMode(0600))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	return json.NewEncoder(f).Encode(execCredential)
+}
+
 // RunKubernetesKubeconfigExecCredential displays the exec credential. It is for internal use only.
 func RunKubernetesKubeconfigExecCredential(c *CmdConfig) error {
 	if len(c.Args) != 1 {
@@ -416,9 +482,15 @@ func RunKubernetesKubeconfigExecCredential(c *CmdConfig) error {
 	}
 
 	kube := c.Kubernetes()
-	clusterID, err := clusterIDize(kube, c.Args[0])
-	if err != nil {
-		return err
+
+	clusterID := c.Args[0]
+	execCredential, err := loadCachedExecCredential(clusterID)
+	if err != nil && Verbose {
+		fmt.Fprintln(os.Stderr, err)
+	}
+
+	if execCredential != nil {
+		return json.NewEncoder(c.Out).Encode(execCredential)
 	}
 
 	kubeconfig, err := kube.GetKubeConfig(clusterID)
@@ -431,9 +503,13 @@ func RunKubernetesKubeconfigExecCredential(c *CmdConfig) error {
 		return err
 	}
 
-	execCredential, err := execCredentialFromConfig(config)
+	execCredential, err = execCredentialFromConfig(config)
 	if err != nil {
 		return err
+	}
+
+	if err := cacheExecCredential(clusterID, execCredential); err != nil && Verbose {
+		fmt.Fprintln(os.Stderr, err)
 	}
 
 	return json.NewEncoder(c.Out).Encode(execCredential)
@@ -451,15 +527,12 @@ func execCredentialFromConfig(config *clientcmdapi.Config) (*clientauthenticatio
 		return nil, fmt.Errorf("received invalid config from API")
 	}
 
-	block, _ := pem.Decode(authInfo.ClientCertificateData)
-	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return nil, err
-	}
-
 	var t *metav1.Time
-	if !cert.NotAfter.IsZero() {
-		t = &metav1.Time{cert.NotAfter}
+	// Attempt to parse certificate to extract expiration. If it fails that's OK, maybe we've migrated to tokens
+	block, _ := pem.Decode(authInfo.ClientCertificateData)
+	if cert, err := x509.ParseCertificate(block.Bytes); err == nil && !cert.NotAfter.IsZero() {
+		// Expire the credentials 10 minutes before NotAfter to account for clock skew
+		t = &metav1.Time{cert.NotAfter.Add(-10 * time.Minute)}
 	}
 
 	execCredential := &clientauthentication.ExecCredential{
