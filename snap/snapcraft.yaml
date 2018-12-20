@@ -1,22 +1,28 @@
 name: doctl
-version: "1.12.2"
+version: git
 summary: A command line tool for DigitalOcean services
 description: doctl is a command line tool for DigitalOcean servics using the API.
-confinement: classic
+confinement: strict
+base: core18
 
 apps:
   doctl:
-    command: bin/doctl
-    plugs: [network]
+    command: bin/launcher
+    plugs: [network, network-bind, home, ssh-keys, password-manager-service]
 
 parts:
+  launcher:
+    plugin: dump
+    source: snap/local
   doctl:
-    source: ..
+    source: .
     plugin: go
     go-importpath: github.com/digitalocean/doctl
-    build-packages: [git]
+    build-packages: [git, bzr, build-essential, gcc]
+    stage-packages: [ssh]
     go-packages: [github.com/digitalocean/doctl/cmd/doctl]
-    install: |
+    override-build: |
+      snapcraftctl build
       mkdir -p $SNAPCRAFT_PART_INSTALL/bash_completions
       mkdir -p $SNAPCRAFT_PART_INSTALL/zsh_completions
       doctl completion bash > $SNAPCRAFT_PART_INSTALL/bash_completions/doctl
